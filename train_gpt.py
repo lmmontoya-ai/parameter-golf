@@ -1,7 +1,7 @@
 """
 The `train_gpt.py` and `train_gpt_mlx.py` scripts are intended as good launching-off points for new participants, not SOTA configs. We'll accept PRs that tune, improve, or simplify these scripts without significantly increasing complexity, but competitive submissions should stay in the `/records` folder.
 
-Hard stop: `train_gpt.py` and `train_gpt_mlx.py` must never be longer than 1500 lines.
+
 """
 
 from __future__ import annotations
@@ -26,6 +26,8 @@ import torch.distributed as dist
 import torch.nn.functional as F
 from torch import Tensor, nn
 from torch.nn.parallel import DistributedDataParallel as DDP
+
+from research.architectures.attention_residuals import BlockAttentionResidual, BlockAttnResConfig
 
 # -----------------------------
 # HYPERPARAMETERS
@@ -69,6 +71,8 @@ class Hyperparameters:
     tie_embeddings = bool(int(os.environ.get("TIE_EMBEDDINGS", "1")))
     rope_base = float(os.environ.get("ROPE_BASE", 10000.0))
     logit_softcap = float(os.environ.get("LOGIT_SOFTCAP", 30.0))
+    attnres_enable = bool(int(os.environ.get("ATTNRES_ENABLE", "0")))
+    attnres_block_layers = int(os.environ.get("ATTNRES_BLOCK_LAYERS", 3))
 
     # Optimizer hyperparameters.
     embed_lr = float(os.environ.get("EMBED_LR", 0.6))
@@ -87,9 +91,9 @@ class Hyperparameters:
     grad_clip_norm = float(os.environ.get("GRAD_CLIP_NORM", 0.0))
 
 # -----------------------------
-# MUON OPTIMIZER 
+# MUON OPTIMIZER
 # -----------------------------
-# 
+#
 # As borrowed from modded-nanogpt
 # Background on Muon: https://kellerjordan.github.io/posts/muon/
 
@@ -169,7 +173,7 @@ class Muon(torch.optim.Optimizer):
 
 
 # -----------------------------
-# TOKENIZER-AGNOSTIC EVALUATION SETUP 
+# TOKENIZER-AGNOSTIC EVALUATION SETUP
 # -----------------------------
 #
 # It's common for small models have a large fraction of their parameters be embeddings, since the 2 * d_model * d_vocab vectors can be gigantic.
@@ -423,7 +427,7 @@ def dequantize_state_dict_int8(obj: dict[str, object]) -> dict[str, Tensor]:
 
 
 # -----------------------------
-# DATA LOADING 
+# DATA LOADING
 # -----------------------------
 
 def load_data_shard(file: Path) -> Tensor:
@@ -519,6 +523,21 @@ def restore_low_dim_params_to_fp32(module: nn.Module) -> None:
         for name, param in module.named_parameters():
             if (param.ndim < 2 or any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)) and param.dtype != torch.float32:
                 param.data = param.data.float()
+
+
+def split_block_optimizer_params(blocks: nn.ModuleList) -> tuple[list[Tensor], list[Tensor]]:
+    block_named_params = list(blocks.named_parameters())
+    matrix_params = [
+        p
+        for name, p in block_named_params
+        if p.ndim == 2 and not any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)
+    ]
+    scalar_params = [
+        p
+        for name, p in block_named_params
+        if p.ndim < 2 or any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)
+    ]
+    return matrix_params, scalar_params
 
 
 class Rotary(nn.Module):
@@ -626,6 +645,7 @@ class Block(nn.Module):
         mlp_mult: int,
         rope_base: float,
         qk_gain_init: float,
+        attnres_enable: bool = False,
     ):
         super().__init__()
         self.attn_norm = RMSNorm()
@@ -635,13 +655,25 @@ class Block(nn.Module):
         self.attn_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
         self.mlp_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
         self.resid_mix = nn.Parameter(torch.stack((torch.ones(dim), torch.zeros(dim))).float())
+        self.attn_res_attn = BlockAttentionResidual(dim) if attnres_enable else None
+        self.attn_res_mlp = BlockAttentionResidual(dim) if attnres_enable else None
+
+    def mix_input(self, x: Tensor, x0: Tensor) -> Tensor:
+        mix = self.resid_mix.to(dtype=x.dtype)
+        return mix[0][None, None, :] * x + mix[1][None, None, :] * x0
+
+    def attn_update(self, h: Tensor) -> Tensor:
+        attn_out = self.attn(self.attn_norm(h))
+        return self.attn_scale.to(dtype=h.dtype)[None, None, :] * attn_out
+
+    def mlp_update(self, h: Tensor) -> Tensor:
+        mlp_out = self.mlp(self.mlp_norm(h))
+        return self.mlp_scale.to(dtype=h.dtype)[None, None, :] * mlp_out
 
     def forward(self, x: Tensor, x0: Tensor) -> Tensor:
-        mix = self.resid_mix.to(dtype=x.dtype)
-        x = mix[0][None, None, :] * x + mix[1][None, None, :] * x0
-        attn_out = self.attn(self.attn_norm(x))
-        x = x + self.attn_scale.to(dtype=x.dtype)[None, None, :] * attn_out
-        x = x + self.mlp_scale.to(dtype=x.dtype)[None, None, :] * self.mlp(self.mlp_norm(x))
+        x = self.mix_input(x, x0)
+        x = x + self.attn_update(x)
+        x = x + self.mlp_update(x)
         return x
 
 
@@ -659,13 +691,21 @@ class GPT(nn.Module):
         logit_softcap: float,
         rope_base: float,
         qk_gain_init: float,
+        attnres_enable: bool,
+        attnres_block_layers: int,
     ):
         super().__init__()
         if logit_softcap <= 0.0:
             raise ValueError(f"logit_softcap must be positive, got {logit_softcap}")
+        if attnres_block_layers < 1 or attnres_block_layers > num_layers:
+            raise ValueError(
+                "ATTNRES_BLOCK_LAYERS must satisfy 1 <= ATTNRES_BLOCK_LAYERS <= NUM_LAYERS; "
+                f"got ATTNRES_BLOCK_LAYERS={attnres_block_layers}, NUM_LAYERS={num_layers}"
+            )
         self.tie_embeddings = tie_embeddings
         self.tied_embed_init_std = tied_embed_init_std
         self.logit_softcap = logit_softcap
+        self.attnres_config = BlockAttnResConfig(enabled=attnres_enable, block_layers=attnres_block_layers)
         self.tok_emb = nn.Embedding(vocab_size, model_dim)
         self.num_encoder_layers = num_layers // 2
         self.num_decoder_layers = num_layers - self.num_encoder_layers
@@ -680,6 +720,7 @@ class GPT(nn.Module):
                     mlp_mult,
                     rope_base,
                     qk_gain_init,
+                    attnres_enable=attnres_enable,
                 )
                 for i in range(num_layers)
             ]
@@ -697,20 +738,47 @@ class GPT(nn.Module):
             if isinstance(module, nn.Linear) and getattr(module, "_zero_init", False):
                 nn.init.zeros_(module.weight)
 
+    def _run_block_with_attnres(
+        self,
+        block: Block,
+        x: Tensor,
+        x0: Tensor,
+        completed_blocks: list[Tensor],
+        layer_idx: int,
+    ) -> Tensor:
+        if block.attn_res_attn is None or block.attn_res_mlp is None:
+            return block(x, x0)
+        partial = block.mix_input(x, x0)
+        h = block.attn_res_attn(completed_blocks, partial)
+        partial = partial + block.attn_update(h)
+        h = block.attn_res_mlp(completed_blocks, partial)
+        x = partial + block.mlp_update(h)
+        if (layer_idx + 1) % self.attnres_config.block_layers == 0:
+            completed_blocks.append(x)
+        return x
+
     def forward(self, input_ids: Tensor, target_ids: Tensor) -> Tensor:
         x = self.tok_emb(input_ids)
         x = F.rms_norm(x, (x.size(-1),))
         x0 = x
         skips: list[Tensor] = []
+        completed_blocks = [x0] if self.attnres_config.enabled else []
 
         # First half stores skips; second half reuses them in reverse order.
         for i in range(self.num_encoder_layers):
-            x = self.blocks[i](x, x0)
+            if self.attnres_config.enabled:
+                x = self._run_block_with_attnres(self.blocks[i], x, x0, completed_blocks, i)
+            else:
+                x = self.blocks[i](x, x0)
             skips.append(x)
         for i in range(self.num_decoder_layers):
             if skips:
                 x = x + self.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skips.pop()
-            x = self.blocks[self.num_encoder_layers + i](x, x0)
+            layer_idx = self.num_encoder_layers + i
+            if self.attnres_config.enabled:
+                x = self._run_block_with_attnres(self.blocks[layer_idx], x, x0, completed_blocks, layer_idx)
+            else:
+                x = self.blocks[layer_idx](x, x0)
 
         x = self.final_norm(x).reshape(-1, x.size(-1))
         targets = target_ids.reshape(-1)
@@ -818,6 +886,10 @@ def main() -> None:
     log0(f"val_bpb:enabled tokenizer_kind=sentencepiece tokenizer_path={args.tokenizer_path}")
     log0(f"train_loader:dataset:{dataset_dir.name} train_shards:{actual_train_files}")
     log0(f"val_loader:shards pattern={args.val_files} tokens:{val_tokens.numel() - 1}")
+    log0(
+        f"attnres:enabled={int(args.attnres_enable)} "
+        f"block_layers={args.attnres_block_layers} implementation=block_attnres_v1"
+    )
 
     # -----------------------------
     # MODEL + OPTIMIZER SETUP
@@ -835,6 +907,8 @@ def main() -> None:
         logit_softcap=args.logit_softcap,
         rope_base=args.rope_base,
         qk_gain_init=args.qk_gain_init,
+        attnres_enable=args.attnres_enable,
+        attnres_block_layers=args.attnres_block_layers,
     ).to(device).bfloat16()
     for module in base_model.modules():
         if isinstance(module, CastedLinear):
@@ -848,17 +922,7 @@ def main() -> None:
     # - untied lm_head (Adam) uses HEAD_LR
     # - matrix params in transformer blocks use MATRIX_LR via Muon
     # - vectors/scalars use SCALAR_LR via Adam
-    block_named_params = list(base_model.blocks.named_parameters())
-    matrix_params = [
-        p
-        for name, p in block_named_params
-        if p.ndim == 2 and not any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)
-    ]
-    scalar_params = [
-        p
-        for name, p in block_named_params
-        if p.ndim < 2 or any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)
-    ]
+    matrix_params, scalar_params = split_block_optimizer_params(base_model.blocks)
     if base_model.skip_weights.numel() > 0:
         scalar_params.append(base_model.skip_weights)
     token_lr = args.tied_embed_lr if args.tie_embeddings else args.embed_lr

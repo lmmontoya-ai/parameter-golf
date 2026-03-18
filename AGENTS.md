@@ -88,6 +88,12 @@ The README notes that the `0.005`-nat evidence requirement is waived for systems
 - When changing anything that affects the tokenizer, dataset, or metric calculation, document the correctness argument explicitly.
 - Always reason about compression and export format together with model design.
 
+## Development Environment
+
+- Use `uv` for local development and testing.
+- Do not make `uv` part of the competition artifact or the submission runtime assumptions.
+- On an `H100` pod, verify that the installed `torch` build is actually CUDA-enabled before trusting wallclock or throughput measurements.
+
 ## Useful Local References
 
 - `README.md`: challenge rules, FAQ, and submission requirements

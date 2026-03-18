@@ -1,0 +1,19 @@
+[project]
+name = "parameter-golf"
+version = "0.0.0"
+description = "Local development environment for the Parameter Golf challenge repo."
+dependencies = [
+    "numpy",
+    "tqdm",
+    "torch==2.10",
+    "huggingface-hub",
+    "kernels",
+    "setuptools",
+    "typing-extensions==4.15.0",
+    "datasets",
+    "tiktoken",
+    "sentencepiece",
+]
+
+[tool.uv]
+package = false

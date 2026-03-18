@@ -9,3 +9,15 @@ data/docs_selected.jsonl
 .mypy_cache/
 .venv
 logs/
+
+# Docker
+.docker/
+.docker-cache/
+docker-cache/
+docker-data/
+docker-compose.override.yml
+docker-compose.local.yml
+docker-compose.*.local.yml
+compose.override.yml
+.env.docker
+.env.docker.*
