@@ -88,16 +88,33 @@ The README notes that the `0.005`-nat evidence requirement is waived for systems
 - When changing anything that affects the tokenizer, dataset, or metric calculation, document the correctness argument explicitly.
 - Always reason about compression and export format together with model design.
 
+## Repo Documentation Layout
+
+Use this rule going forward:
+
+- `experiments/` = planned experiments and gates
+- `docs/research/` = observed results and research conclusions
+- `records/` = frozen runnable artifacts
+
+Do not mix these roles:
+
+- put hypotheses, pass/fail criteria, and planned variants in `experiments/`
+- put actual run outcomes, environment findings, and research conclusions in `docs/research/`
+- put only runnable frozen snapshots in `records/`
+
 ## Development Environment
 
 - Use `uv` for local development and testing.
 - Do not make `uv` part of the competition artifact or the submission runtime assumptions.
 - On an `H100` pod, verify that the installed `torch` build is actually CUDA-enabled before trusting wallclock or throughput measurements.
+- If `torch.compile` or Triton is used on rented GPU hardware, verify that a C compiler is available. On the `2026-03-18` Vast `4xH100` proxy run, `build-essential` plus `CC=gcc CXX=g++` was required.
 
 ## Useful Local References
 
 - `README.md`: challenge rules, FAQ, and submission requirements
 - `docs/BASELINE.md`: detailed explanation of the current baseline script and record
+- `docs/research/README.md`: where observed run notes and research conclusions belong
+- `docs/research/2026-03-18_4xh100_baseline_proxy.md`: `4xH100` baseline proxy reproduction and environment findings
 - `data/README.md`: dataset and tokenizer export workflow
 
 When in doubt, optimize for:

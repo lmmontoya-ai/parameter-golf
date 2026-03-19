@@ -173,3 +173,7 @@ Current development caveat:
 
 - [Attention Residuals](https://arxiv.org/abs/2603.15031)
 - [Official Attention Residuals repository](https://github.com/MoonshotAI/Attention-Residuals)
+
+## Draft Notes
+
+- `docs/research/2026-03-18_attention_residuals_draft_notes.md`

@@ -28,6 +28,7 @@ from torch import Tensor, nn
 from torch.nn.parallel import DistributedDataParallel as DDP
 
 from research.architectures.attention_residuals import BlockAttentionResidual, BlockAttnResConfig
+from research.architectures.recurrent_depth import RecurrentDepthConfig
 
 # -----------------------------
 # HYPERPARAMETERS
@@ -73,6 +74,15 @@ class Hyperparameters:
     logit_softcap = float(os.environ.get("LOGIT_SOFTCAP", 30.0))
     attnres_enable = bool(int(os.environ.get("ATTNRES_ENABLE", "0")))
     attnres_block_layers = int(os.environ.get("ATTNRES_BLOCK_LAYERS", 3))
+    recurrent_enable = bool(int(os.environ.get("RECURRENT_ENABLE", "0")))
+    recurrent_prelude_layers = int(os.environ.get("RECURRENT_PRELUDE_LAYERS", 1))
+    recurrent_core_layers = int(os.environ.get("RECURRENT_CORE_LAYERS", 2))
+    recurrent_steps = int(os.environ.get("RECURRENT_STEPS", 3))
+    recurrent_backprop_steps = int(os.environ.get("RECURRENT_BACKPROP_STEPS", 3))
+    recurrent_coda_layers = int(os.environ.get("RECURRENT_CODA_LAYERS", 2))
+    recurrent_eval_steps = int(os.environ.get("RECURRENT_EVAL_STEPS", 3))
+    recurrent_state_init = os.environ.get("RECURRENT_STATE_INIT", "like_init")
+    recurrent_input_injection = os.environ.get("RECURRENT_INPUT_INJECTION", "linear_concat")
 
     # Optimizer hyperparameters.
     embed_lr = float(os.environ.get("EMBED_LR", 0.6))
@@ -525,19 +535,22 @@ def restore_low_dim_params_to_fp32(module: nn.Module) -> None:
                 param.data = param.data.float()
 
 
-def split_block_optimizer_params(blocks: nn.ModuleList) -> tuple[list[Tensor], list[Tensor]]:
-    block_named_params = list(blocks.named_parameters())
+def split_named_optimizer_params(named_params: list[tuple[str, Tensor]]) -> tuple[list[Tensor], list[Tensor]]:
     matrix_params = [
         p
-        for name, p in block_named_params
+        for name, p in named_params
         if p.ndim == 2 and not any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)
     ]
     scalar_params = [
         p
-        for name, p in block_named_params
+        for name, p in named_params
         if p.ndim < 2 or any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)
     ]
     return matrix_params, scalar_params
+
+
+def split_block_optimizer_params(blocks: nn.ModuleList) -> tuple[list[Tensor], list[Tensor]]:
+    return split_named_optimizer_params(list(blocks.named_parameters()))
 
 
 class Rotary(nn.Module):
@@ -677,6 +690,38 @@ class Block(nn.Module):
         return x
 
 
+class RecurrentBlock(nn.Module):
+    def __init__(
+        self,
+        dim: int,
+        num_heads: int,
+        num_kv_heads: int,
+        mlp_mult: int,
+        rope_base: float,
+        qk_gain_init: float,
+    ):
+        super().__init__()
+        self.attn_norm = RMSNorm()
+        self.mlp_norm = RMSNorm()
+        self.attn = CausalSelfAttention(dim, num_heads, num_kv_heads, rope_base, qk_gain_init)
+        self.mlp = MLP(dim, mlp_mult)
+        self.attn_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
+        self.mlp_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
+
+    def attn_update(self, x: Tensor) -> Tensor:
+        attn_out = self.attn(self.attn_norm(x))
+        return self.attn_scale.to(dtype=x.dtype)[None, None, :] * attn_out
+
+    def mlp_update(self, x: Tensor) -> Tensor:
+        mlp_out = self.mlp(self.mlp_norm(x))
+        return self.mlp_scale.to(dtype=x.dtype)[None, None, :] * mlp_out
+
+    def forward(self, x: Tensor) -> Tensor:
+        x = x + self.attn_update(x)
+        x = x + self.mlp_update(x)
+        return x
+
+
 class GPT(nn.Module):
     def __init__(
         self,
@@ -792,6 +837,147 @@ class GPT(nn.Module):
         return F.cross_entropy(logits.float(), targets, reduction="mean")
 
 
+class RecurrentGPT(nn.Module):
+    def __init__(
+        self,
+        vocab_size: int,
+        num_layers: int,
+        model_dim: int,
+        num_heads: int,
+        num_kv_heads: int,
+        mlp_mult: int,
+        tie_embeddings: bool,
+        tied_embed_init_std: float,
+        logit_softcap: float,
+        rope_base: float,
+        qk_gain_init: float,
+        recurrent_config: RecurrentDepthConfig,
+    ):
+        super().__init__()
+        if logit_softcap <= 0.0:
+            raise ValueError(f"logit_softcap must be positive, got {logit_softcap}")
+        recurrent_config.validate(num_layers=num_layers)
+        self.tie_embeddings = tie_embeddings
+        self.tied_embed_init_std = tied_embed_init_std
+        self.logit_softcap = logit_softcap
+        self.recurrent_config = recurrent_config
+        self.tok_emb = nn.Embedding(vocab_size, model_dim)
+        self.prelude_blocks = nn.ModuleList(
+            [
+                RecurrentBlock(
+                    model_dim,
+                    num_heads,
+                    num_kv_heads,
+                    mlp_mult,
+                    rope_base,
+                    qk_gain_init,
+                )
+                for _ in range(recurrent_config.prelude_layers)
+            ]
+        )
+        self.core_blocks = nn.ModuleList(
+            [
+                RecurrentBlock(
+                    model_dim,
+                    num_heads,
+                    num_kv_heads,
+                    mlp_mult,
+                    rope_base,
+                    qk_gain_init,
+                )
+                for _ in range(recurrent_config.core_layers)
+            ]
+        )
+        self.adapter = CastedLinear(model_dim * 2, model_dim, bias=False)
+        self.coda_blocks = nn.ModuleList(
+            [
+                RecurrentBlock(
+                    model_dim,
+                    num_heads,
+                    num_kv_heads,
+                    mlp_mult,
+                    rope_base,
+                    qk_gain_init,
+                )
+                for _ in range(recurrent_config.coda_layers)
+            ]
+        )
+        self.final_norm = RMSNorm()
+        self.lm_head = None if tie_embeddings else CastedLinear(model_dim, vocab_size, bias=False)
+        if self.lm_head is not None:
+            self.lm_head._zero_init = True
+        self._init_weights()
+
+    def _init_weights(self) -> None:
+        if self.tie_embeddings:
+            nn.init.normal_(self.tok_emb.weight, mean=0.0, std=self.tied_embed_init_std)
+        for module in self.modules():
+            if isinstance(module, nn.Linear) and getattr(module, "_zero_init", False):
+                nn.init.zeros_(module.weight)
+
+    def _initialize_state(self, input_embeds: Tensor) -> Tensor:
+        if self.recurrent_config.state_init == "zero":
+            return torch.zeros_like(input_embeds)
+        if self.recurrent_config.state_init == "normal":
+            return torch.randn_like(input_embeds)
+        x = torch.empty_like(input_embeds)
+        return nn.init.trunc_normal_(x, mean=0.0, std=self.tied_embed_init_std, a=-3 * self.tied_embed_init_std, b=3 * self.tied_embed_init_std)
+
+    def _recurrent_step(self, x: Tensor, input_embeds: Tensor) -> Tensor:
+        if self.recurrent_config.input_injection != "linear_concat":
+            raise RuntimeError(
+                "recurrent_depth_v1 only supports RECURRENT_INPUT_INJECTION=linear_concat"
+            )
+        x = self.adapter(torch.cat((x, input_embeds), dim=-1))
+        for block in self.core_blocks:
+            x = block(x)
+        return x
+
+    def _run_recurrence(self, input_embeds: Tensor) -> Tensor:
+        x = self._initialize_state(input_embeds)
+        steps = self.recurrent_config.steps if self.training else self.recurrent_config.eval_steps
+        if self.training:
+            prefix_steps = max(steps - self.recurrent_config.backprop_steps, 0)
+            if prefix_steps > 0:
+                with torch.no_grad():
+                    for _ in range(prefix_steps):
+                        x = self._recurrent_step(x, input_embeds)
+            for _ in range(steps - prefix_steps):
+                x = self._recurrent_step(x, input_embeds)
+            return x
+        for _ in range(steps):
+            x = self._recurrent_step(x, input_embeds)
+        return x
+
+    def _iter_named_block_params(self) -> list[tuple[str, Tensor]]:
+        named_params: list[tuple[str, Tensor]] = []
+        named_params.extend((f"prelude_blocks.{name}", p) for name, p in self.prelude_blocks.named_parameters())
+        named_params.extend((f"core_blocks.{name}", p) for name, p in self.core_blocks.named_parameters())
+        named_params.extend((f"adapter.{name}", p) for name, p in self.adapter.named_parameters())
+        named_params.extend((f"coda_blocks.{name}", p) for name, p in self.coda_blocks.named_parameters())
+        return named_params
+
+    def forward(self, input_ids: Tensor, target_ids: Tensor) -> Tensor:
+        x = self.tok_emb(input_ids)
+        x = F.rms_norm(x, (x.size(-1),))
+        for block in self.prelude_blocks:
+            x = block(x)
+        input_embeds = x
+        x = self._run_recurrence(input_embeds)
+        for block in self.coda_blocks:
+            x = block(x)
+        x = self.final_norm(x).reshape(-1, x.size(-1))
+        targets = target_ids.reshape(-1)
+        if self.tie_embeddings:
+            logits_proj = F.linear(x, self.tok_emb.weight)
+        else:
+            if self.lm_head is None:
+                raise RuntimeError("lm_head is required when tie_embeddings=False")
+            logits_proj = self.lm_head(x)
+        logits = self.logit_softcap * torch.tanh(logits_proj / self.logit_softcap)
+        return F.cross_entropy(logits.float(), targets, reduction="mean")
+
+
 # -----------------------------
 # TRAINING
 # -----------------------------
@@ -890,26 +1076,69 @@ def main() -> None:
         f"attnres:enabled={int(args.attnres_enable)} "
         f"block_layers={args.attnres_block_layers} implementation=block_attnres_v1"
     )
+    log0(
+        f"recurrent:enabled={int(args.recurrent_enable)} "
+        f"prelude_layers={args.recurrent_prelude_layers} "
+        f"core_layers={args.recurrent_core_layers} "
+        f"steps={args.recurrent_steps} "
+        f"backprop_steps={args.recurrent_backprop_steps} "
+        f"coda_layers={args.recurrent_coda_layers} "
+        f"eval_steps={args.recurrent_eval_steps} "
+        f"state_init={args.recurrent_state_init} "
+        f"input_injection={args.recurrent_input_injection} "
+        f"implementation=recurrent_depth_v1"
+    )
 
     # -----------------------------
     # MODEL + OPTIMIZER SETUP
     # -----------------------------
 
-    base_model = GPT(
-        vocab_size=args.vocab_size,
-        num_layers=args.num_layers,
-        model_dim=args.model_dim,
-        num_heads=args.num_heads,
-        num_kv_heads=args.num_kv_heads,
-        mlp_mult=args.mlp_mult,
-        tie_embeddings=args.tie_embeddings,
-        tied_embed_init_std=args.tied_embed_init_std,
-        logit_softcap=args.logit_softcap,
-        rope_base=args.rope_base,
-        qk_gain_init=args.qk_gain_init,
-        attnres_enable=args.attnres_enable,
-        attnres_block_layers=args.attnres_block_layers,
-    ).to(device).bfloat16()
+    if args.recurrent_enable and args.attnres_enable:
+        raise ValueError("RECURRENT_ENABLE=1 cannot be combined with ATTNRES_ENABLE=1 in isolated v1 experiments")
+
+    recurrent_config = RecurrentDepthConfig(
+        enabled=args.recurrent_enable,
+        prelude_layers=args.recurrent_prelude_layers,
+        core_layers=args.recurrent_core_layers,
+        steps=args.recurrent_steps,
+        backprop_steps=args.recurrent_backprop_steps,
+        coda_layers=args.recurrent_coda_layers,
+        eval_steps=args.recurrent_eval_steps,
+        state_init=args.recurrent_state_init,
+        input_injection=args.recurrent_input_injection,
+    )
+
+    if args.recurrent_enable:
+        base_model: nn.Module = RecurrentGPT(
+            vocab_size=args.vocab_size,
+            num_layers=args.num_layers,
+            model_dim=args.model_dim,
+            num_heads=args.num_heads,
+            num_kv_heads=args.num_kv_heads,
+            mlp_mult=args.mlp_mult,
+            tie_embeddings=args.tie_embeddings,
+            tied_embed_init_std=args.tied_embed_init_std,
+            logit_softcap=args.logit_softcap,
+            rope_base=args.rope_base,
+            qk_gain_init=args.qk_gain_init,
+            recurrent_config=recurrent_config,
+        ).to(device).bfloat16()
+    else:
+        base_model = GPT(
+            vocab_size=args.vocab_size,
+            num_layers=args.num_layers,
+            model_dim=args.model_dim,
+            num_heads=args.num_heads,
+            num_kv_heads=args.num_kv_heads,
+            mlp_mult=args.mlp_mult,
+            tie_embeddings=args.tie_embeddings,
+            tied_embed_init_std=args.tied_embed_init_std,
+            logit_softcap=args.logit_softcap,
+            rope_base=args.rope_base,
+            qk_gain_init=args.qk_gain_init,
+            attnres_enable=args.attnres_enable,
+            attnres_block_layers=args.attnres_block_layers,
+        ).to(device).bfloat16()
     for module in base_model.modules():
         if isinstance(module, CastedLinear):
             module.float()
@@ -922,9 +1151,14 @@ def main() -> None:
     # - untied lm_head (Adam) uses HEAD_LR
     # - matrix params in transformer blocks use MATRIX_LR via Muon
     # - vectors/scalars use SCALAR_LR via Adam
-    matrix_params, scalar_params = split_block_optimizer_params(base_model.blocks)
-    if base_model.skip_weights.numel() > 0:
-        scalar_params.append(base_model.skip_weights)
+    if isinstance(base_model, GPT):
+        matrix_params, scalar_params = split_block_optimizer_params(base_model.blocks)
+        if base_model.skip_weights.numel() > 0:
+            scalar_params.append(base_model.skip_weights)
+    elif isinstance(base_model, RecurrentGPT):
+        matrix_params, scalar_params = split_named_optimizer_params(base_model._iter_named_block_params())
+    else:
+        raise TypeError(f"Unsupported model type for optimizer split: {type(base_model)!r}")
     token_lr = args.tied_embed_lr if args.tie_embeddings else args.embed_lr
     optimizer_tok = torch.optim.Adam(
         [{"params": [base_model.tok_emb.weight], "lr": token_lr, "base_lr": token_lr}],

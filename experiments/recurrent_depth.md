@@ -2,84 +2,91 @@
 
 ## Hypothesis
 
-Sharing the heavy transformer blocks across logical depth can preserve or improve compression quality per byte by trading extra compute for fewer stored parameters. This is one of the cleanest architecture bets for a byte-capped competition.
+A paper-shaped latent recurrent model should buy much better quality per byte than the current fixed-depth baseline by replacing repeated transformer blocks with a small shared recurrent core that can be unrolled multiple times.
 
 ## Why It May Help This Specific Competition
 
-- Parameter Golf rewards effective depth bought with compute instead of bytes.
-- The baseline has no cross-layer weight sharing.
-- Recurrent depth directly attacks the dominant cost center: repeated dense matrices.
+- Parameter Golf rewards effective depth bought with compute instead of stored weights.
+- The baseline spends most of its bytes on repeated dense transformer blocks.
+- A recurrent core is a cleaner byte-saving mechanism than the previous "share layers by logical index" idea because it preserves the paper's latent-state recurrence structure.
 
 ## Competition / Rules Risk
 
 - Low to medium rules risk.
-- No tokenizer or dataset changes are required.
-- Eval-time compute must stay within the challenge limit, so v1 should not rely on extra recurrence at evaluation beyond what is used in training.
+- No tokenizer, dataset, or export changes are required in v1.
+- Eval-time compute must stay bounded, so v1 uses fixed train/eval recurrence counts and does not rely on extra test-time loops.
 
 ## Minimal Implementation Design In This Repo
 
-First implementation target: **fixed recurrence with shared heavy blocks and unshared lightweight step adapters**.
+First implementation target: **RecurrentGPT v1**.
 
 Keep these baseline pieces unchanged in v1:
 
 - tokenizer
 - dataset
+- validation path
 - export path
-- overall effective logical depth of `9`
-- evaluation procedure
+- tied embeddings
+- Muon + Adam optimizer split
+- current attention and `relu^2` MLP internals
 
-Proposed configuration knobs:
+Replace the current recurrent-depth plan with this macro-architecture:
+
+- unique **prelude** blocks
+- shared **core** blocks reused across recurrent steps
+- unique **coda** blocks
+- one shared input-reinjection adapter per recurrent step
+
+Default configuration:
 
 - `RECURRENT_ENABLE=1`
-- `NUM_SHARED_BLOCKS=3`
+- `RECURRENT_PRELUDE_LAYERS=1`
+- `RECURRENT_CORE_LAYERS=2`
 - `RECURRENT_STEPS=3`
+- `RECURRENT_BACKPROP_STEPS=3`
+- `RECURRENT_CODA_LAYERS=2`
 - `RECURRENT_EVAL_STEPS=3`
+- `RECURRENT_STATE_INIT=like_init`
+- `RECURRENT_INPUT_INJECTION=linear_concat`
 
-V1 architecture:
+Effective depth constraint:
 
-- Replace `9` unique transformer blocks with `3` physical blocks reused `3` times each, for effective depth `9`.
-- Logical schedule:
-  - layers `0,1,2,0,1,2,0,1,2`
-- Keep these weights shared across recurrence:
-  - `c_q`
-  - `c_k`
-  - `c_v`
-  - attention output projection
-  - MLP input projection
-  - MLP output projection
-  - internal RMSNorm modules
-- Move these lightweight parameters to **unshared logical-step adapters**:
-  - `q_gain`
-  - `attn_scale`
-  - `mlp_scale`
-  - `resid_mix`
-- Keep skip weights defined at logical depth positions, not physical block positions.
+- `RECURRENT_PRELUDE_LAYERS + RECURRENT_CORE_LAYERS * RECURRENT_STEPS + RECURRENT_CODA_LAYERS == NUM_LAYERS`
 
-Train/eval policy:
+V1 forward path:
 
-- `RECURRENT_STEPS=3` and `RECURRENT_EVAL_STEPS=3` in v1
-- no eval-only extra loops
-- no adaptive halting
+1. embed tokens and apply the current embedding RMSNorm preprocessing
+2. run unique prelude blocks to produce `input_embeds`
+3. initialize a separate latent state `x`
+4. for each recurrent step:
+   - optionally run prefix steps under `torch.no_grad()` when `RECURRENT_BACKPROP_STEPS < RECURRENT_STEPS`
+   - apply one shared adapter to `concat(x, input_embeds)`
+   - run the shared core blocks
+5. run unique coda blocks
+6. apply final norm and LM head exactly as in the baseline
 
-Optimizer policy:
+State init and input injection in v1:
 
-- physical shared matrices stay in the matrix optimizer path
-- step-adapter tensors stay in the scalar optimizer path
-- token embedding / head policy remains baseline
+- `RECURRENT_STATE_INIT=like_init` uses a truncated normal with `tied_embed_init_std`
+- `RECURRENT_INPUT_INJECTION=linear_concat` uses one shared bias-free `CastedLinear(2 * model_dim, model_dim)`
 
-Implementation simplicity threshold:
+What v1 explicitly does **not** do:
 
-- no custom recurrent kernel
-- no learned halting
-- no step-dependent tokenizer or data changes
+- no encoder/decoder skip path
+- no logical-depth adapters
+- no qk bias
+- no gated SiLU MLP
+- no Takase init
+- no randomized recurrence sampling
+- no adaptive exits or KV-cache-per-step inference logic
 
 ## Variant Ladder
 
-1. `3` shared blocks x `3` recurrence, fixed train/eval loops
-2. `2` shared blocks x `4` recurrence plus one final unique readout block
-3. `1` shared block x `8` recurrence plus one final unique readout block
+1. `prelude=1`, `core=2`, `steps=3`, `coda=2`
+2. same shape, but `RECURRENT_BACKPROP_STEPS=2`
+3. same train shape, then test `RECURRENT_EVAL_STEPS=4` or `5` only if variant 1 is already stable
 
-Do not move past variant 1 if the quality drop is already too large.
+Do not move to eval-only extra steps if the fixed-step train/eval model is not already competitive.
 
 ## Metrics To Record
 
@@ -92,27 +99,36 @@ Do not move past variant 1 if the quality drop is already too large.
 - eval wallclock
 - peak memory
 - parameter count reduction vs baseline
-- recurrent compile overhead notes
+- compile stability notes
+
+Current development caveat:
+
+- while the code lives in `research/`, the current `train_gpt.py` code-size logging undercounts true submission bytes because it only measures the runner file
+- treat logged `code bytes` as development-only until a runnable snapshot is frozen into `records/`
 
 ## Acceptance Criteria
 
 `pass`:
 
-- compressed model bytes reduced by at least `20%`
-- final `val_bpb` no worse than `+0.005` vs baseline
-- total artifact bytes remain under `16,000,000`
+- parameter count drops by about `35%` or more
+- compressed model bytes drop by at least `25%`
+- `final_int8_zlib_roundtrip_exact val_bpb` is no worse than `+0.010` vs the validated `4xH100` baseline proxy
+- training `step_avg` is no worse than `+10%`
+- compile stays enabled and stable
 
 `promote`:
 
-- compressed model bytes reduced by at least `25%`
-- final `val_bpb` no worse than `+0.003` vs baseline or better than baseline outright
-- no more than `15%` training slowdown
+- compressed model bytes drop by `25%+`
+- `final_int8_zlib_roundtrip_exact val_bpb` is no worse than `+0.005` vs baseline or better
+- the same config survives a full `4xH100 -> 1200s` proxy run cleanly
+- only after that, test `RECURRENT_EVAL_STEPS=4` or `5` as a separate v1.1 inference-scaling branch
 
 ## Kill Criteria
 
-- variant 1 loses more than `0.010` `val_bpb`
-- recurrence increases train wallclock by more than `15%` while byte savings stay below `20%`
-- implementation requires major optimizer redesign beyond the step-adapter split
+- byte savings under `20%`
+- quality loss worse than `+0.010 val_bpb`
+- compile/runtime instability comparable to the failed Attention Residuals branch
+- major optimizer redesign becomes necessary
 
 ## Estimated Engineering Cost
 
@@ -121,12 +137,14 @@ Do not move past variant 1 if the quality drop is already too large.
 
 ## Merge Compatibility
 
-- Strong candidate to combine with `attention_residuals`
 - Strong candidate to combine with `bitnet_ternary_qat`
-- Potentially compatible with `masa_weight_sharing`, but only after both work in isolation
-- Competes directly with `looped_llms` in the first round and should not be automatically merged with it
+- Potentially compatible with `masa_weight_sharing`
+- Leave `attention_residuals` separate until recurrent depth works in isolation
+- Competes directly with `looped_llms` in the first round and should not be auto-merged with it
 
 ## References
 
 - [Scaling up Test-Time Compute with Latent Reasoning: A Recurrent Depth Approach](https://arxiv.org/abs/2502.05171)
-- [Recurrent depth reference repository](https://github.com/seal-rg/recurrent-pretraining)
+- [ar5iv paper HTML](https://ar5iv.labs.arxiv.org/html/2502.05171v2)
+- [seal-rg/recurrent-pretraining](https://github.com/seal-rg/recurrent-pretraining)
+- [`recpre/raven_modeling_minimal.py`](https://raw.githubusercontent.com/seal-rg/recurrent-pretraining/main/recpre/raven_modeling_minimal.py)

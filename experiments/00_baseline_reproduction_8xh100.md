@@ -126,3 +126,9 @@ No architectural or optimizer changes belong in this experiment.
 
 - This is a prerequisite for every other experiment.
 - No combination work is allowed before this experiment passes.
+
+## Observed Notes
+
+- `2026-03-18`: [`4xH100` proxy baseline reproduction note](/Users/lumontoya/research/openai/parameter-golf/docs/research/2026-03-18_4xh100_baseline_proxy.md)
+  - useful for early screening and stack validation
+  - not a substitute for a true `8xH100` record-track verification run
