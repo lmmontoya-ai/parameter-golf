@@ -19,6 +19,9 @@ python3 data/cached_challenge_fineweb.py --variant sp1024
 
 This populates `./data/datasets/fineweb10B_sp1024/` and `./data/tokenizers/`.
 By default it downloads the full validation split and 8B training tokens (80 train shards).
+The downloader is resumable, prints an explicit download plan, verifies the requested local file set after downloading, and writes a machine-readable readiness summary to:
+
+- `data/datasets/<dataset_name>/_download_state.json`
 
 To fetch more training shards, pass `--train-shards`:
 
@@ -37,6 +40,25 @@ python3 data/cached_challenge_fineweb.py --variant sp1024 --train-shards 100
 Validation is always downloaded in full from the fixed `fineweb_val_*` split. Training on the first `N` train shards means training on the prefix of the same frozen shuffled export, so the data order stays aligned with the baseline for that tokenizer family.
 
 The default published repo is `willdepueoai/parameter-golf`, with the export rooted under the repo subdirectory `datasets/`.
+
+## Deterministic Rented-Pod Prep
+
+For rented GPU machines, use a two-step gate:
+
+```bash
+python3 data/cached_challenge_fineweb.py --variant sp1024 --train-shards 80
+python3 data/cached_challenge_fineweb.py --variant sp1024 --train-shards 80 --verify-only
+```
+
+The second command should succeed before training starts. If it fails, the pod is not data-ready yet.
+
+Useful flags:
+
+- `--verify-only`: fail if any requested artifact is still missing
+- `--force`: re-download requested files even if they already exist locally
+- `--retries N`: retry each missing artifact up to `N` times before failing
+
+This makes the pod's data state explicit and easy to audit in logs.
 
 ## Rebuilding Tokenizers From Published Docs
 

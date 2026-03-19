@@ -108,6 +108,10 @@ Do not mix these roles:
 - Do not make `uv` part of the competition artifact or the submission runtime assumptions.
 - On an `H100` pod, verify that the installed `torch` build is actually CUDA-enabled before trusting wallclock or throughput measurements.
 - If `torch.compile` or Triton is used on rented GPU hardware, verify that a C compiler is available. On the `2026-03-18` Vast `4xH100` proxy run, `build-essential` plus `CC=gcc CXX=g++` was required.
+- Treat dataset prep as a gated step on rented pods. The canonical flow is:
+  - `python3 data/cached_challenge_fineweb.py --variant sp1024 --train-shards 80`
+  - `python3 data/cached_challenge_fineweb.py --variant sp1024 --train-shards 80 --verify-only`
+- Do not start training until the verify-only command succeeds and `data/datasets/<dataset_name>/_download_state.json` shows `ready: true`.
 
 ## Useful Local References
 

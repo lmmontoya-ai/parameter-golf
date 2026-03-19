@@ -5,7 +5,7 @@
 
 **OpenAI Model Craft Challenge: Parameter Golf** is a challenge to train the best language model that fits in a 16MB artifact and trains in under 10 minutes on 8xH100s, evaluated by compression on the FineWeb validation set (tokenizer-agnostic, bits per byte).
 
-This challenge is heavily inspired by the [NanoGPT Speedrunning](https://github.com/KellerJordan/modded-nanogpt) challenge, where participants compete to train a model that reaches 3.28 FineWeb validation loss as quickly as possible. We're excited to see how optimizing for a parameter-constrained setting pushes people toward unique architectures (test-time compute, aggressive parameter tying, depth recurrence, low-rank training, ...), compression schemes (low precision, QAT, bitnets, novel tokenizers, ...), and other creative submissions (test-time training, long context, megakernels ...). 
+This challenge is heavily inspired by the [NanoGPT Speedrunning](https://github.com/KellerJordan/modded-nanogpt) challenge, where participants compete to train a model that reaches 3.28 FineWeb validation loss as quickly as possible. We're excited to see how optimizing for a parameter-constrained setting pushes people toward unique architectures (test-time compute, aggressive parameter tying, depth recurrence, low-rank training, ...), compression schemes (low precision, QAT, bitnets, novel tokenizers, ...), and other creative submissions (test-time training, long context, megakernels ...).
 
 If you're familiar with [neural scaling laws](https://arxiv.org/abs/2001.08361), you can consider this challenge a form of L(N) optimization, where the objective is to optimize the lowest loss given a fixed number of parameters (N) unconstrained by data, compute, steps, or architecture. Challenges like the [NanoGPT Speedrun](https://github.com/KellerJordan/modded-nanogpt), which optimizes for a form of L(T) (~lowest loss given constrained time) or the [NanoGPT Slowrun](https://github.com/qlabs-eng/slowrun), which optimizes for L(D) (lowest loss given constrained dataset size), can be thought of as equivalent challenges in this family.
 
@@ -21,7 +21,7 @@ Many researchers at OpenAI first distinguished themselves through elite mathemat
 
 In June, we plan to hire a small cohort of early-career researchers, targeting current undergraduate students and recent graduates, including Olympiad medalists and elite competitors. For exceptional participants, the challenge may also serve as a way to stand out to OpenAI researchers and recruiters.
 
-The challenge runs from March 18th to April 30th. 
+The challenge runs from March 18th to April 30th.
 
 Happy training!
 
@@ -83,7 +83,7 @@ Validation always runs on the full `fineweb_val_*` split, which is the fixed fir
 
 Once you're happy with your local tests, or you want more compute, switch to a remote CUDA machine.
 
-You can rent GPUs from anywhere, but OpenAI is partnering with Runpod to make setup as easy as possible.  
+You can rent GPUs from anywhere, but OpenAI is partnering with Runpod to make setup as easy as possible.
 
 #### Launching a 1xH100 Pod
 
@@ -108,6 +108,15 @@ python3 data/cached_challenge_fineweb.py --variant sp1024
 ```
 
 This defaults to the full validation split plus 80 training shards (8B tokens). If you only want a smaller subset while iterating, pass `--train-shards N`, for example `--train-shards 1`.
+The downloader now prints a manifest-driven plan, verifies the requested local files, and writes a ready summary to `data/datasets/<dataset_name>/_download_state.json`.
+
+On rented machines, verify the local cache before launching training:
+
+```bash
+python3 data/cached_challenge_fineweb.py --variant sp1024 --train-shards 80 --verify-only
+```
+
+If this command fails, the pod is not data-ready yet and training should not start.
 
 Launch your first training run. Note that we're passing `nproc_per_node=1` because we're running on a single H100 GPU in this case.
 

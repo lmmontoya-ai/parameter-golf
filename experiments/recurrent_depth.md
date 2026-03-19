@@ -148,3 +148,13 @@ Current development caveat:
 - [ar5iv paper HTML](https://ar5iv.labs.arxiv.org/html/2502.05171v2)
 - [seal-rg/recurrent-pretraining](https://github.com/seal-rg/recurrent-pretraining)
 - [`recpre/raven_modeling_minimal.py`](https://raw.githubusercontent.com/seal-rg/recurrent-pretraining/main/recpre/raven_modeling_minimal.py)
+
+Observed draft note:
+
+- `docs/research/2026-03-18_recurrent_depth_draft_notes.md`
+- `docs/research/2026-03-18_recurrent_depth_param_eval_sweep_draft_notes.md`
+- `docs/research/2026-03-18_recurrent_depth_eval4_only_draft_notes.md`
+- `docs/research/2026-03-18_recurrent_depth_train4_eval4_draft_notes.md`
+- `docs/research/2026-03-18_val_only_and_recurrent44_draft_notes.md`
+- `docs/research/2026-03-18_recurrent44_deeper223_real_train_proxy_draft_notes.md`
+- `docs/research/2026-03-18_recurrent44_deeper223_w576_real_train_proxy_draft_notes.md`

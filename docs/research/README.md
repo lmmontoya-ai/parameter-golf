@@ -22,3 +22,10 @@ Current notes:
 
 - `2026-03-18_4xh100_baseline_proxy.md`
 - `2026-03-18_attention_residuals_draft_notes.md`
+- `2026-03-18_recurrent_depth_draft_notes.md`
+- `2026-03-18_recurrent_depth_param_eval_sweep_draft_notes.md`
+- `2026-03-18_recurrent_depth_eval4_only_draft_notes.md`
+- `2026-03-18_recurrent_depth_train4_eval4_draft_notes.md`
+- `2026-03-18_val_only_and_recurrent44_draft_notes.md`
+- `2026-03-18_recurrent44_deeper223_real_train_proxy_draft_notes.md`
+- `2026-03-18_recurrent44_deeper223_w576_real_train_proxy_draft_notes.md`
