@@ -107,7 +107,7 @@ These ideas should be tracked, but not promoted to full design docs in the first
 - Paired Head Attention
 - Partial Key Offset
 - Partitioned Hyperconnections
-- Tokenizer redesign as a standalone track
+- Standalone tokenizer redesign beyond the combined tokenizer+embedding branch
 - Compression-only export improvements beyond the baseline int8 path
 
 Reason for backlog status:
@@ -126,3 +126,16 @@ Reason for backlog status:
 - [data_selection.md](./data_selection.md)
 - [distillation.md](./distillation.md)
 - [masa_weight_sharing.md](./masa_weight_sharing.md)
+
+## Expansion Docs
+
+These are second-wave branches that became interesting after the first recurrent and infrastructure passes:
+
+- [compression_aware_dense_transformer.md](./compression_aware_dense_transformer.md)
+- [larger_tokenizer_factorized_embeddings.md](./larger_tokenizer_factorized_embeddings.md)
+- [early_layer_recurrence_width.md](./early_layer_recurrence_width.md)
+- [low_rank_ffn_factorization.md](./low_rank_ffn_factorization.md)
+- [hybrid_attention_recurrent_layers.md](./hybrid_attention_recurrent_layers.md)
+- [multi_token_prediction.md](./multi_token_prediction.md)
+- [eval_time_adaptation_cache.md](./eval_time_adaptation_cache.md)
+- [frontier_decomposition_pr89.md](./frontier_decomposition_pr89.md)
