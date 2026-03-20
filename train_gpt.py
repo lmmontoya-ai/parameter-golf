@@ -137,6 +137,9 @@ class Hyperparameters:
     beta2 = float(os.environ.get("BETA2", 0.95))
     adam_eps = float(os.environ.get("ADAM_EPS", 1e-8))
     grad_clip_norm = float(os.environ.get("GRAD_CLIP_NORM", 0.0))
+    weight_decay_tok = float(os.environ.get("WEIGHT_DECAY_TOK", 0.0))
+    weight_decay_scalar = float(os.environ.get("WEIGHT_DECAY_SCALAR", 0.0))
+    weight_decay_head = float(os.environ.get("WEIGHT_DECAY_HEAD", 0.0))
     muon_variant = os.environ.get("MUON_VARIANT", "muon")
     normuon_beta2 = float(os.environ.get("NORMUON_BETA2", 0.95))
 
@@ -746,6 +749,25 @@ def fake_quantize_weight_ste(weight: Tensor, *, quant_bits: int, clip_quantile: 
     q, scale = quantize_float_tensor(weight, quant_bits=quant_bits, clip_quantile=clip_quantile)
     dequantized = dequantize_quantized_tensor(q, scale, dtype=weight.dtype)
     return weight + (dequantized - weight).detach()
+
+
+def make_nonmuon_optimizer(
+    params: list[Tensor],
+    *,
+    lr: float,
+    base_lr: float,
+    betas: tuple[float, float],
+    eps: float,
+    weight_decay: float,
+    fused: bool,
+):
+    optimizer_cls = torch.optim.AdamW if weight_decay > 0 else torch.optim.Adam
+    return optimizer_cls(
+        [{"params": params, "lr": lr, "base_lr": base_lr, "weight_decay": weight_decay}],
+        betas=betas,
+        eps=eps,
+        fused=fused,
+    )
 
 
 def quantize_state_dict(
@@ -2531,10 +2553,13 @@ def main() -> None:
         if base_model.skip_weights.numel() > 0:
             scalar_params.append(base_model.skip_weights)
         token_lr = args.tied_embed_lr if args.tie_embeddings else args.embed_lr
-        optimizer_tok = torch.optim.Adam(
-            [{"params": base_model.embedding_optimizer_params(), "lr": token_lr, "base_lr": token_lr}],
+        optimizer_tok = make_nonmuon_optimizer(
+            list(base_model.embedding_optimizer_params()),
+            lr=token_lr,
+            base_lr=token_lr,
             betas=(args.beta1, args.beta2),
             eps=args.adam_eps,
+            weight_decay=args.weight_decay_tok,
             fused=True,
         )
         optimizer_muon = Muon(
@@ -2547,28 +2572,37 @@ def main() -> None:
         )
         for group in optimizer_muon.param_groups:
             group["base_lr"] = args.matrix_lr
-        optimizer_scalar = torch.optim.Adam(
-            [{"params": scalar_params, "lr": args.scalar_lr, "base_lr": args.scalar_lr}],
+        optimizer_scalar = make_nonmuon_optimizer(
+            scalar_params,
+            lr=args.scalar_lr,
+            base_lr=args.scalar_lr,
             betas=(args.beta1, args.beta2),
             eps=args.adam_eps,
+            weight_decay=args.weight_decay_scalar,
             fused=True,
         )
         optimizers = [optimizer_tok, optimizer_muon, optimizer_scalar]
         if base_model.lm_head is not None:
-            optimizer_head = torch.optim.Adam(
-                [{"params": [base_model.lm_head.weight], "lr": args.head_lr, "base_lr": args.head_lr}],
+            optimizer_head = make_nonmuon_optimizer(
+                [base_model.lm_head.weight],
+                lr=args.head_lr,
+                base_lr=args.head_lr,
                 betas=(args.beta1, args.beta2),
                 eps=args.adam_eps,
+                weight_decay=args.weight_decay_head,
                 fused=True,
             )
             optimizers.insert(1, optimizer_head)
     elif isinstance(base_model, RecurrentGPT):
         matrix_params, scalar_params = split_named_optimizer_params(base_model._iter_named_block_params())
         token_lr = args.tied_embed_lr if args.tie_embeddings else args.embed_lr
-        optimizer_tok = torch.optim.Adam(
-            [{"params": base_model.embedding_optimizer_params(), "lr": token_lr, "base_lr": token_lr}],
+        optimizer_tok = make_nonmuon_optimizer(
+            list(base_model.embedding_optimizer_params()),
+            lr=token_lr,
+            base_lr=token_lr,
             betas=(args.beta1, args.beta2),
             eps=args.adam_eps,
+            weight_decay=args.weight_decay_tok,
             fused=True,
         )
         optimizer_muon = Muon(
@@ -2581,18 +2615,24 @@ def main() -> None:
         )
         for group in optimizer_muon.param_groups:
             group["base_lr"] = args.matrix_lr
-        optimizer_scalar = torch.optim.Adam(
-            [{"params": scalar_params, "lr": args.scalar_lr, "base_lr": args.scalar_lr}],
+        optimizer_scalar = make_nonmuon_optimizer(
+            scalar_params,
+            lr=args.scalar_lr,
+            base_lr=args.scalar_lr,
             betas=(args.beta1, args.beta2),
             eps=args.adam_eps,
+            weight_decay=args.weight_decay_scalar,
             fused=True,
         )
         optimizers = [optimizer_tok, optimizer_muon, optimizer_scalar]
         if base_model.lm_head is not None:
-            optimizer_head = torch.optim.Adam(
-                [{"params": [base_model.lm_head.weight], "lr": args.head_lr, "base_lr": args.head_lr}],
+            optimizer_head = make_nonmuon_optimizer(
+                [base_model.lm_head.weight],
+                lr=args.head_lr,
+                base_lr=args.head_lr,
                 betas=(args.beta1, args.beta2),
                 eps=args.adam_eps,
+                weight_decay=args.weight_decay_head,
                 fused=True,
             )
             optimizers.insert(1, optimizer_head)
@@ -2617,6 +2657,10 @@ def main() -> None:
             f"tie_embeddings:{args.tie_embeddings} embed_lr:{token_lr} "
             f"head_lr:{args.head_lr if base_model.lm_head is not None else 0.0} "
             f"matrix_lr:{args.matrix_lr} scalar_lr:{args.scalar_lr}"
+        )
+        log0(
+            f"weight_decay:tok={args.weight_decay_tok} scalar={args.weight_decay_scalar} "
+            f"head={args.weight_decay_head}"
         )
     log0(
         f"train_batch_tokens:{args.train_batch_tokens} train_seq_len:{args.train_seq_len} "

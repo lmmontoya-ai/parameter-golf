@@ -1,0 +1,8 @@
+[
+  {
+    "name": "sp_bpe_2048",
+    "kind": "sentencepiece_bpe",
+    "dataset_suffix": "sp2048",
+    "vocab_size": 2048
+  }
+]

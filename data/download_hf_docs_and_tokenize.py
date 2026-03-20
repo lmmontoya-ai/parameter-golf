@@ -501,6 +501,11 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="Limit the number of docs used for tokenizer training.",
     )
+    parser.add_argument(
+        "--tokenizer-only",
+        action="store_true",
+        help="Build tokenizer artifacts and manifest only; skip dataset shard export.",
+    )
     parser.add_argument("--skip-byte", action="store_true", help="Skip byte-tokenizer export.")
     parser.add_argument(
         "--reuse-sp-model",
@@ -590,6 +595,16 @@ def main() -> None:
     }
 
     for tok in tokenizers:
+        manifest["tokenizers"].append(tok["manifest"])
+
+    if args.tokenizer_only:
+        manifest = relativize_manifest_paths(manifest, output_root)
+        manifest_path = output_root / "manifest.json"
+        manifest_path.write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
+        print(f"Done. Manifest: {manifest_path}", flush=True)
+        return
+
+    for tok in tokenizers:
         output_dir = datasets_dir / tok["dataset_name"]
         print(f"Exporting dataset: {tok['dataset_name']}", flush=True)
         stats = export_shards(
@@ -600,7 +615,6 @@ def main() -> None:
             shard_size=int(args.chunk_tokens),
             docs_total=docs_total,
         )
-        manifest["tokenizers"].append(tok["manifest"])
         manifest["datasets"].append(
             {
                 "name": tok["dataset_name"],

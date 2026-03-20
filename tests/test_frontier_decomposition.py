@@ -58,6 +58,34 @@ class FakeQuantLinearTest(unittest.TestCase):
             self.assertFalse(linear.fake_quant_enabled)
         self.assertTrue(linear.fake_quant_enabled)
 
+    def test_dense_candidate_shape_smoke_on_cpu(self):
+        model = tg.GPT(
+            vocab_size=2048,
+            num_layers=2,
+            model_dim=64,
+            num_heads=4,
+            num_kv_heads=2,
+            mlp_mult=3,
+            tie_embeddings=True,
+            tied_embed_init_std=0.005,
+            logit_softcap=30.0,
+            rope_base=10000.0,
+            qk_gain_init=1.5,
+            attnres_enable=False,
+            attnres_block_layers=2,
+            factor_embed_enable=False,
+            factor_embed_dim=192,
+        )
+        tg.configure_model_fake_quant(model, enabled=True, quant_bits=6, clip_quantile=None)
+
+        input_ids = torch.randint(0, 2048, (2, 32))
+        target_ids = torch.randint(0, 2048, (2, 32))
+        loss = model(input_ids, target_ids)
+        loss.backward()
+
+        self.assertEqual(loss.shape, torch.Size([]))
+        self.assertIsNotNone(model.tok_emb.weight.grad)
+
 
 @unittest.skipIf(torch is None, IMPORT_ERROR)
 class Int6ExportTest(unittest.TestCase):
@@ -158,6 +186,38 @@ class SurrogateValidationTokensTest(unittest.TestCase):
         tokens = torch.arange(0, 10_000, dtype=torch.int64)
         truncated = tg.truncate_validation_tokens_for_surrogate(tokens, max_targets=128, eval_seq_len=1_024)
         self.assertEqual(truncated.numel(), 1_025)
+
+
+@unittest.skipIf(torch is None, IMPORT_ERROR)
+class NonMuonOptimizerTest(unittest.TestCase):
+    def test_zero_weight_decay_preserves_adam(self):
+        param = torch.nn.Parameter(torch.randn(4, 4))
+        opt = tg.make_nonmuon_optimizer(
+            [param],
+            lr=0.01,
+            base_lr=0.01,
+            betas=(0.9, 0.95),
+            eps=1e-8,
+            weight_decay=0.0,
+            fused=False,
+        )
+        self.assertIsInstance(opt, torch.optim.Adam)
+        self.assertNotIsInstance(opt, torch.optim.AdamW)
+        self.assertEqual(opt.param_groups[0]["weight_decay"], 0.0)
+
+    def test_positive_weight_decay_uses_adamw(self):
+        param = torch.nn.Parameter(torch.randn(4, 4))
+        opt = tg.make_nonmuon_optimizer(
+            [param],
+            lr=0.01,
+            base_lr=0.01,
+            betas=(0.9, 0.95),
+            eps=1e-8,
+            weight_decay=0.01,
+            fused=False,
+        )
+        self.assertIsInstance(opt, torch.optim.AdamW)
+        self.assertAlmostEqual(opt.param_groups[0]["weight_decay"], 0.01)
 
 
 if __name__ == "__main__":

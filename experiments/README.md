@@ -139,3 +139,4 @@ These are second-wave branches that became interesting after the first recurrent
 - [multi_token_prediction.md](./multi_token_prediction.md)
 - [eval_time_adaptation_cache.md](./eval_time_adaptation_cache.md)
 - [frontier_decomposition_pr89.md](./frontier_decomposition_pr89.md)
+- [sp2048_dense_frontier_candidate.md](./sp2048_dense_frontier_candidate.md)
